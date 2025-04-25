@@ -11,80 +11,121 @@ Databricks' AI assistant, through a chat interface.
 Note: This is experimental code and is not intended for production use.
 """
 
-import os
+import asyncio
 import json
 import logging
+import os
 from typing import Dict, List, Optional
-from dotenv import load_dotenv
+
 from aiohttp import web
-from botbuilder.core import BotFrameworkAdapterSettings, BotFrameworkAdapter, ActivityHandler, TurnContext
+from botbuilder.core import (
+    ActivityHandler,
+    BotFrameworkAdapter,
+    BotFrameworkAdapterSettings,
+    TurnContext,
+)
 from botbuilder.schema import Activity, ChannelAccount
 from databricks.sdk import WorkspaceClient
 from databricks.sdk.service.dashboards import GenieAPI
-import asyncio
 
 # Log
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Env vars
-load_dotenv()
-
+# Set these as env variables in the web app!
 DATABRICKS_SPACE_ID = os.getenv("DATABRICKS_SPACE_ID")
 DATABRICKS_HOST = os.getenv("DATABRICKS_HOST")
 DATABRICKS_TOKEN = os.getenv("DATABRICKS_TOKEN")
-APP_ID = os.getenv("MicrosoftAppId", "")
-APP_PASSWORD = os.getenv("MicrosoftAppPassword", "")
+APP_ID = os.getenv("APP_ID", "")
+APP_PASSWORD = os.getenv("APP_PASSWORD", "")
+
+
+logger.debug(f"HOST: {DATABRICKS_HOST}")
 
 workspace_client = WorkspaceClient(
-    host=DATABRICKS_HOST,
-    token=DATABRICKS_TOKEN
+    host=DATABRICKS_HOST, token=DATABRICKS_TOKEN, auth_type="pat"
 )
 
 genie_api = GenieAPI(workspace_client.api_client)
 
-async def ask_genie(question: str, space_id: str, conversation_id: Optional[str] = None) -> tuple[str, str]:
+
+async def ask_genie(
+    question: str, space_id: str, conversation_id: Optional[str] = None
+) -> tuple[str, str]:
     try:
         loop = asyncio.get_running_loop()
         if conversation_id is None:
-            initial_message = await loop.run_in_executor(None, genie_api.start_conversation_and_wait, space_id, question)
+            initial_message = await loop.run_in_executor(
+                None, genie_api.start_conversation_and_wait, space_id, question
+            )
             conversation_id = initial_message.conversation_id
         else:
-            initial_message = await loop.run_in_executor(None, genie_api.create_message_and_wait, space_id, conversation_id, question)
+            initial_message = await loop.run_in_executor(
+                None,
+                genie_api.create_message_and_wait,
+                space_id,
+                conversation_id,
+                question,
+            )
 
         query_result = None
         if initial_message.query_result is not None:
-            query_result = await loop.run_in_executor(None, genie_api.get_message_query_result,
-                space_id, initial_message.conversation_id, initial_message.id)
+            query_result = await loop.run_in_executor(
+                None,
+                genie_api.get_message_query_result,
+                space_id,
+                initial_message.conversation_id,
+                initial_message.id,
+            )
 
-        message_content = await loop.run_in_executor(None, genie_api.get_message,
-            space_id, initial_message.conversation_id, initial_message.id)
+        message_content = await loop.run_in_executor(
+            None,
+            genie_api.get_message,
+            space_id,
+            initial_message.conversation_id,
+            initial_message.id,
+        )
 
         if query_result and query_result.statement_response:
-            results = await loop.run_in_executor(None, workspace_client.statement_execution.get_statement,
-                query_result.statement_response.statement_id)
-            
+            results = await loop.run_in_executor(
+                None,
+                workspace_client.statement_execution.get_statement,
+                query_result.statement_response.statement_id,
+            )
+
             query_description = ""
             for attachment in message_content.attachments:
                 if attachment.query and attachment.query.description:
                     query_description = attachment.query.description
                     break
 
-            return json.dumps({
-                "columns": results.manifest.schema.as_dict(),
-                "data": results.result.as_dict(),
-                "query_description": query_description
-            }), conversation_id
+            return (
+                json.dumps(
+                    {
+                        "columns": results.manifest.schema.as_dict(),
+                        "data": results.result.as_dict(),
+                        "query_description": query_description,
+                    }
+                ),
+                conversation_id,
+            )
 
         if message_content.attachments:
             for attachment in message_content.attachments:
                 if attachment.text and attachment.text.content:
-                    return json.dumps({"message": attachment.text.content}), conversation_id
+                    return (
+                        json.dumps({"message": attachment.text.content}),
+                        conversation_id,
+                    )
 
         return json.dumps({"message": message_content.content}), conversation_id
     except Exception as e:
         logger.error(f"Error in ask_genie: {str(e)}")
-        return json.dumps({"error": "An error occurred while processing your request."}), conversation_id
+        return (
+            json.dumps({"error": "An error occurred while processing your request."}),
+            conversation_id,
+        )
+
 
 def process_query_results(answer_json: Dict) -> str:
     response = ""
@@ -118,12 +159,13 @@ def process_query_results(answer_json: Dict) -> str:
         response += f"{answer_json['message']}\n\n"
     else:
         response += "No data available.\n\n"
-    
+
     return response
 
-SETTINGS = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD
-                                       )
+
+SETTINGS = BotFrameworkAdapterSettings(APP_ID, APP_PASSWORD)
 ADAPTER = BotFrameworkAdapter(SETTINGS)
+
 
 class MyBot(ActivityHandler):
     def __init__(self):
@@ -135,7 +177,9 @@ class MyBot(ActivityHandler):
         conversation_id = self.conversation_ids.get(user_id)
 
         try:
-            answer, new_conversation_id = await ask_genie(question, DATABRICKS_SPACE_ID, conversation_id)
+            answer, new_conversation_id = await ask_genie(
+                question, DATABRICKS_SPACE_ID, conversation_id
+            )
             self.conversation_ids[user_id] = new_conversation_id
 
             answer_json = json.loads(answer)
@@ -143,17 +187,25 @@ class MyBot(ActivityHandler):
 
             await turn_context.send_activity(response)
         except json.JSONDecodeError:
-            await turn_context.send_activity("Failed to decode response from the server.")
+            await turn_context.send_activity(
+                "Failed to decode response from the server."
+            )
         except Exception as e:
             logger.error(f"Error processing message: {str(e)}")
-            await turn_context.send_activity("An error occurred while processing your request.")
+            await turn_context.send_activity(
+                "An error occurred while processing your request."
+            )
 
-    async def on_members_added_activity(self, members_added: List[ChannelAccount], turn_context: TurnContext):
+    async def on_members_added_activity(
+        self, members_added: List[ChannelAccount], turn_context: TurnContext
+    ):
         for member in members_added:
             if member.id != turn_context.activity.recipient.id:
                 await turn_context.send_activity("Welcome to the Databricks Genie Bot!")
 
+
 BOT = MyBot()
+
 
 async def messages(req: web.Request) -> web.Response:
     if "application/json" in req.headers["Content-Type"]:
@@ -172,6 +224,7 @@ async def messages(req: web.Request) -> web.Response:
     except Exception as e:
         logger.error(f"Error processing request: {str(e)}")
         return web.Response(status=500)
+
 
 app = web.Application()
 app.router.add_post("/api/messages", messages)
